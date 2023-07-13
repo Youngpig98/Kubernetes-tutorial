@@ -22,7 +22,7 @@
 
 1. [环境准备](./pre-request)
 2. 集群安装
-   - 使用[kubeadm](./kubeadm)进行安装
+   - [使用kubeadm进行安装](./kubeadm)
    - [二进制安装](./binary)
    - [使用kubez-ansible工具安装](https://github.com/gopixiu-io/kubez-ansible)
 

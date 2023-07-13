@@ -67,3 +67,8 @@ systemctl restart network
 ping www.baidu.com
 ```
 
+
+
+## 参考
+
+[How To Configure Static IP Address In Linux And Unix](https://ostechnix.com/configure-static-ip-address-linux-unix/)
