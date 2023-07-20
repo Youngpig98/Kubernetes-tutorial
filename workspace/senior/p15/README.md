@@ -296,7 +296,7 @@ No events.
 
 ​	基于上述讲述，为了统一概念和方便叙述，在本专栏中，我以后凡是提到“Volume”，指的就是一个远程存储服务挂载在宿主机上的持久化目录；而“PV”，指的是这个 Volume 在 Kubernetes 里的 API 对象。
 
-​	**需要注意的是，这套容器持久化存储体系，完全是 Kubernetes 项目自己负责管理的，并不依赖于 `docker volume` 命令和 Docker 的存储插件。**当然，这套体系本身就比 docker volume 命令的诞生时间还要早得多。
+​	**需要注意的是，这套容器持久化存储体系，完全是 Kubernetes 项目自己负责管理的，并不依赖于 `docker volume` 命令和 Docker 的存储插件**。当然，这套体系本身就比 docker volume 命令的诞生时间还要早得多。
 
 ## 思考题
 
