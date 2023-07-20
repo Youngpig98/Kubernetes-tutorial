@@ -1,327 +1,453 @@
-# PV、PVC体系是不是多此一举？从本地持久化卷谈起
+# 容器存储实践：CSI插件编写指南
 
-​	我们之前讨论过这样一个话题：像 PV、PVC 这样的用法，是不是有“过度设计”的嫌疑？
+​	为了能够覆盖到 CSI 插件的所有功能，我这一次选择了 DigitalOcean 的块存储（Block Storage）服务，来作为实践对象。
 
-​	比如，我们公司的运维人员可以像往常一样维护一套 NFS 或者 Ceph 服务器，根本不必学习 Kubernetes。而开发人员，则完全可以靠“复制粘贴”的方式，在 Pod 的 YAML 文件里填上 Volumes 字段，而不需要去使用 PV 和 PVC。
+​	DigitalOcean 是业界知名的“最简”公有云服务，即：它只提供虚拟机、存储、网络等为数不多的几个基础功能，其他功能一概不管。而这，恰恰就使得 DigitalOcean 成了我们在公有云上实践 Kubernetes 的最佳选择。
 
-​	实际上，如果只是为了职责划分，PV、PVC 体系确实不见得比直接在 Pod 里声明 Volumes 字段有什么优势。
+​	**我们这次编写的 CSI 插件的功能，就是：让我们运行在 DigitalOcean 上的 Kubernetes 集群能够使用它的块存储服务，作为容器的持久化存储。**
 
-​	不过，你有没有想过这样一个问题，如果[Kubernetes 内置的 20 种持久化数据卷实现](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#types-of-persistent-volumes)，都没办法满足你的容器存储需求时，该怎么办？
+> 备注：在 DigitalOcean 上部署一个 Kubernetes 集群的过程，也很简单。你只需要先在 DigitalOcean 上创建几个虚拟机，然后按照流程使用kubeadm直接部署即可。
 
-​	这个情况乍一听起来有点不可思议。但实际上，凡是鼓捣过开源项目的读者应该都有所体会，“不能用”“不好用”“需要定制开发”，这才是落地开源基础设施项目的三大常态。
-
-​	而在持久化存储领域，用户呼声最高的定制化需求，莫过于支持“本地”持久化存储了。
-
-​	也就是说，用户希望 Kubernetes 能够直接使用宿主机上的本地磁盘目录，而不依赖于远程存储服务，来提供“持久化”的容器 Volume。
-
-​	这样做的好处很明显，由于这个 Volume 直接使用的是本地磁盘，尤其是 SSD 盘，它的读写性能相比于大多数远程存储来说，要好得多。这个需求对本地物理服务器部署的私有 Kubernetes 集群来说，非常常见。
-
-​	所以，Kubernetes 在 v1.10 之后，就逐渐依靠 PV、PVC 体系实现了这个特性。这个特性的名字叫作：Local Persistent Volume。
-
-​	不过，首先需要明确的是，**Local Persistent Volume 并不适用于所有应用**。事实上，它的适用范围非常固定，比如：高优先级的系统应用，需要在多个不同节点上存储数据，并且对 I/O 较为敏感。典型的应用包括：分布式数据存储比如 MongoDB、Cassandra 等，分布式文件系统比如 GlusterFS、Ceph 等，以及需要在本地磁盘上进行大量数据缓存的分布式应用。
-
-​	其次，相比于正常的 PV，一旦这些节点宕机且不能恢复时，Local Persistent Volume 的数据就可能丢失。这就要求**使用 Local Persistent Volume 的应用必须具备数据备份和恢复的能力**，允许你把这些数据定时备份在其他位置。
-
-​	接下来，我就为你深入讲解一下这个特性。
-
-​	不难想象，**Local Persistent Volume 的设计，主要面临两个难点**。
-
-​	**第一个难点在于**：如何把本地磁盘抽象成 PV。
-
-​	可能你会说，Local Persistent Volume，不就等同于 hostPath 加 NodeAffinity 吗？
-
-​	比如，一个 Pod 可以声明使用类型为 Local 的 PV，而这个 PV 其实就是一个 hostPath 类型的 Volume。如果这个 hostPath 对应的目录，已经在节点 A 上被事先创建好了。那么，我只需要再给这个 Pod 加上一个 nodeAffinity=nodeA，不就可以使用这个 Volume 了吗？
-
-​	事实上，**你绝不应该把一个宿主机上的目录当作 PV 使用**。这是因为，这种本地目录的存储行为完全不可控，它所在的磁盘随时都可能被应用写满，甚至造成整个宿主机宕机。而且，不同的本地目录之间也缺乏哪怕最基础的 I/O 隔离机制。
-
-​	所以，一个 Local Persistent Volume 对应的存储介质，一定是一块额外挂载在宿主机的磁盘或者块设备（“额外”的意思是，它不应该是宿主机根目录所使用的主硬盘）。这个原则，我们可以称为“**一个 PV 一块盘**”。
-
-​	**第二个难点在于**：调度器如何保证 Pod 始终能被正确地调度到它所请求的 Local Persistent Volume 所在的节点上呢？
-
-​	造成这个问题的原因在于，对于常规的 PV 来说，Kubernetes 都是先调度 Pod 到某个节点上，然后，再通过“两阶段处理”来“持久化”这台机器上的 Volume 目录，进而完成 Volume 目录与容器的绑定挂载。
-
-​	可是，对于 Local PV 来说，节点上可供使用的磁盘（或者块设备），必须是运维人员提前准备好的。它们在不同节点上的挂载情况可以完全不同，甚至有的节点可以没这种磁盘。
-
-​	所以，这时候，调度器就必须能够知道所有节点与 Local Persistent Volume 对应的磁盘的关联关系，然后根据这个信息来调度 Pod。
-
-​	这个原则，我们可以称为“**在调度的时候考虑 Volume 分布**”。在 Kubernetes 的调度器里，有一个叫作 VolumeBindingChecker 的过滤条件专门负责这个事情。在 Kubernetes v1.11 中，这个过滤条件已经默认开启了。
-
-​	基于上述讲述，**在开始使用 Local Persistent Volume 之前，你首先需要在集群里配置好磁盘或者块设备**。在公有云上，这个操作等同于给虚拟机额外挂载一个磁盘，比如 GCE 的 Local SSD 类型的磁盘就是一个典型例子。
-
-​	而在我们部署的私有环境中，你有两种办法来完成这个步骤。
-
-- 第一种，当然就是给你的宿主机挂载并格式化一个可用的本地磁盘，这也是最常规的操作；
-- 第二种，对于实验环境，你其实可以在宿主机上挂载几个 RAM Disk（内存盘）来模拟本地磁盘。
-
-​	接下来，我会使用第二种方法，在我们之前部署的 Kubernetes 集群上进行实践。
-
-​	首先，在名叫 node-1 的宿主机上创建一个挂载点，比如 /mnt/disks；然后，用几个 RAM Disk 来模拟本地磁盘，如下所示：
-
-```shell
-# 在node-1上执行
-$ mkdir /mnt/disks
-$ for vol in vol1 vol2 vol3; do
-    mkdir /mnt/disks/$vol
-    mount -t tmpfs $vol /mnt/disks/$vol
-done
-```
-
-​	需要注意的是，如果你希望其他节点也能支持 Local Persistent Volume 的话，那就需要为它们也执行上述操作，并且确保这些磁盘的名字（vol1、vol2 等）都不重复。
-
-​	**接下来，我们就可以为这些本地磁盘定义对应的 PV 了**，如下所示：
-
-```yaml
-apiVersion: v1
-kind: PersistentVolume
-metadata:
-  name: example-pv
-spec:
-  capacity:
-    storage: 5Gi
-  volumeMode: Filesystem
-  accessModes:
-  - ReadWriteOnce
-  persistentVolumeReclaimPolicy: Delete
-  storageClassName: local-storage
-  local:
-    path: /mnt/disks/vol1
-  nodeAffinity:
-    required:
-      nodeSelectorTerms:
-      - matchExpressions:
-        - key: kubernetes.io/hostname
-          operator: In
-          values:
-          - node-1
-```
-
-​	可以看到，这个 PV 的定义里：local 字段，指定了它是一个 Local Persistent Volume；而 path 字段，指定的正是这个 PV 对应的本地磁盘的路径，即：/mnt/disks/vol1。
-
-​	当然了，这也就意味着如果 Pod 要想使用这个 PV，那它就必须运行在 node-1 上。所以，在这个 PV 的定义里，需要有一个 nodeAffinity 字段指定 node-1 这个节点的名字。这样，调度器在调度 Pod 的时候，就能够知道一个 PV 与节点的对应关系，从而做出正确的选择。**这正是 Kubernetes 实现“在调度的时候就考虑 Volume 分布”的主要方法**。
-
-​	**接下来**，我们就可以使用 `kubect create` 来创建这个 PV，如下所示：
-
-```shell
-$ kubectl create -f local-pv.yaml 
-persistentvolume/example-pv created
-
-$ kubectl get pv
-NAME         CAPACITY   ACCESS MODES   RECLAIM POLICY  STATUS      CLAIM             STORAGECLASS    REASON    AGE
-example-pv   5Gi        RWO            Delete           Available                     local-storage             16s
-```
-
-​	可以看到，这个 PV 创建后，进入了 Available（可用）状态。
-
-​	而使用 PV 和 PVC 的最佳实践，是你要创建一个 StorageClass 来描述这个 PV，如下所示：
+​	而有了 CSI 插件之后，持久化存储的用法就非常简单了，你只需要创建一个如下所示的 StorageClass 对象即可：
 
 ```yaml
 kind: StorageClass
 apiVersion: storage.k8s.io/v1
 metadata:
-  name: local-storage
-provisioner: kubernetes.io/no-provisioner
-volumeBindingMode: WaitForFirstConsumer
+  name: do-block-storage
+  namespace: kube-system
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: com.digitalocean.csi.dobs
 ```
 
-​	这个 StorageClass 的名字，叫作 local-storage。需要注意的是，在它的 provisioner 字段，我们指定的是 no-provisioner。这是因为 Local Persistent Volume 目前尚不支持 Dynamic Provisioning，所以它没办法在用户创建 PVC 的时候，就自动创建出对应的 PV。也就是说，我们前面创建 PV 的操作，**是不可以省略的**。
+​	有了这个 StorageClass，External Provisoner 就会为集群中新出现的 PVC 自动创建出 PV，然后调用 CSI 插件创建出这个 PV 对应的 Volume，这正是 CSI 体系中 Dynamic Provisioning 的实现方式。
 
-​	与此同时，这个 StorageClass 还定义了一个 volumeBindingMode=WaitForFirstConsumer 的属性。它是 Local Persistent Volume 里一个非常重要的特性，即：**延迟绑定**。
+> 备注：storageclass.kubernetes.io/is-default-class: "true"的意思，是使用这个 StorageClass 作为默认的持久化存储提供者。
 
-​	我们知道，当你提交了 PV 和 PVC 的 YAML 文件之后，Kubernetes 就会根据它们俩的属性，以及它们指定的 StorageClass 来进行绑定。只有绑定成功后，Pod 才能通过声明这个 PVC 来使用对应的 PV。
+​	不难看到，这个 StorageClass 里唯一引人注意的，是 provisioner=com.digitalocean.csi.dobs 这个字段。显然，这个字段告诉了 Kubernetes，请使用名叫 com.digitalocean.csi.dobs 的 CSI 插件来为我处理这个 StorageClass 相关的所有操作。
 
-​	可是，如果你使用的是 Local Persistent Volume 的话，就会发现，这个流程根本行不通。比如，现在你有一个 Pod，它声明使用的 PVC 叫作 pvc-1。并且，我们规定，这个 Pod 只能运行在 node-2 上。
+​	那么，Kubernetes 又是如何知道一个 CSI 插件的名字的呢？
 
-​	而在 Kubernetes 集群中，有两个属性（比如：大小、读写权限）相同的 Local 类型的 PV。
+​	这就需要从 CSI 插件的第一个服务 CSI Identity 说起了。
 
-​	其中，第一个 PV 的名字叫作 pv-1，它对应的磁盘所在的节点是 node-1。而第二个 PV 的名字叫作 pv-2，它对应的磁盘所在的节点是 node-2。
-
-​	假设现在，Kubernetes 的 Volume 控制循环里，首先检查到了 pvc-1 和 pv-1 的属性是匹配的，于是就将它们俩绑定在一起。
-
-​	然后，你用 `kubectl create` 创建了这个 Pod。
-
-​	这时候，问题就出现了。
-
-​	调度器看到，这个 Pod 所声明的 pvc-1 已经绑定了 pv-1，而 pv-1 所在的节点是 node-1，根据“调度器必须在调度的时候考虑 Volume 分布”的原则，这个 Pod 自然会被调度到 node-1 上。
-
-​	可是，我们前面已经规定过，这个 Pod 根本不允许运行在 node-1 上。所以。最后的结果就是，这个 Pod 的调度必然会失败。
-
-​	**这就是为什么，在使用 Local Persistent Volume 的时候，我们必须想办法推迟这个“绑定”操作**。
-
-​	那么，具体推迟到什么时候呢？答案是：推迟到调度的时候。
-
-​	所以说，StorageClass 里的 volumeBindingMode=WaitForFirstConsumer 的含义，就是告诉 Kubernetes 里的 Volume 控制循环（“红娘”）：虽然你已经发现这个 StorageClass 关联的 PVC 与 PV 可以绑定在一起，但请不要现在就执行绑定操作（即：设置 PVC 的 VolumeName 字段）。
-
-​	而要等到第一个声明使用该 PVC 的 Pod 出现在调度器之后，调度器再综合考虑所有的调度规则，当然也包括每个 PV 所在的节点位置，来统一决定，这个 Pod 声明的 PVC，到底应该跟哪个 PV 进行绑定。
-
-​	这样，在上面的例子里，由于这个 Pod 不允许运行在 pv-1 所在的节点 node-1，所以它的 PVC 最后会跟 pv-2 绑定，并且 Pod 也会被调度到 node-2 上。
-
-​	所以，通过这个延迟绑定机制，原本实时发生的 PVC 和 PV 的绑定过程，就被延迟到了 Pod 第一次调度的时候在调度器中进行，**从而保证了这个绑定结果不会影响 Pod 的正常调度**。
-
-​	当然，在具体实现中，调度器实际上维护了一个与 Volume Controller 类似的控制循环，专门负责为那些声明了“延迟绑定”的 PV 和 PVC 进行绑定工作。
-
-​	通过这样的设计，这个额外的绑定操作，并不会拖慢调度器的性能。而当一个 Pod 的 PVC 尚未完成绑定时，调度器也不会等待，而是会直接把这个 Pod 重新放回到待调度队列，等到下一个调度周期再做处理。
-
-​	在明白了这个机制之后，我们就可以创建 StorageClass 了，如下所示：
+​	其实，一个 CSI 插件的代码结构非常简单，如下所示：
 
 ```shell
-$ kubectl create -f local-sc.yaml 
-storageclass.storage.k8s.io/local-storage created
+tree $GOPATH/src/github.com/digitalocean/csi-digitalocean/driver  
+$GOPATH/src/github.com/digitalocean/csi-digitalocean/driver 
+├── controller.go
+├── driver.go
+├── identity.go
+├── mounter.go
+└── node.go
 ```
 
-​	接下来，我们只需要定义一个非常普通的 PVC，就可以让 Pod 使用到上面定义好的 Local Persistent Volume 了，如下所示：
+​	其中，CSI Identity 服务的实现，就定义在了 driver 目录下的 identity.go 文件里。当然，为了能够让 Kubernetes 访问到 CSI Identity 服务，我们需要先在 driver.go 文件里，定义一个标准的 gRPC Server，如下所示：
+
+```go
+// Run starts the CSI plugin by communication over the given endpoint
+func (d *Driver) Run() error {
+ ...
+ 
+ listener, err := net.Listen(u.Scheme, addr)
+ ...
+ 
+ d.srv = grpc.NewServer(grpc.UnaryInterceptor(errHandler))
+ csi.RegisterIdentityServer(d.srv, d)
+ csi.RegisterControllerServer(d.srv, d)
+ csi.RegisterNodeServer(d.srv, d)
+ 
+ d.ready = true // we're now ready to go!
+ ...
+ return d.srv.Serve(listener)
+}
+```
+
+​	可以看到，只要把编写好的 gRPC Server 注册给 CSI，它就可以响应来自 External Components 的 CSI 请求了。
+
+​	CSI Identity 服务中，最重要的接口是 GetPluginInfo，它返回的就是这个插件的名字和版本号，如下所示：
+
+> 备注：CSI 各个服务的接口我在上一篇文章中已经介绍过，你也可以在这里找到它的 protoc 文件。
+
+```go
+func (d *Driver) GetPluginInfo(ctx context.Context, req *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {
+ resp := &csi.GetPluginInfoResponse{
+  Name:          driverName,
+  VendorVersion: version,
+ }
+ ...
+}
+```
+
+​	其中，driverName 的值，正是"com.digitalocean.csi.dobs"。所以说，Kubernetes 正是通过 GetPluginInfo 的返回值，来找到你在 StorageClass 里声明要使用的 CSI 插件的。
+
+> 备注：CSI 要求插件的名字遵守[“反向 DNS”格式](https://en.wikipedia.org/wiki/Reverse_domain_name_notation)。
+
+​	另外一个 GetPluginCapabilities 接口也很重要。这个接口返回的是这个 CSI 插件的“能力”。比如，当你编写的 CSI 插件不准备实现“Provision 阶段”和“Attach 阶段”（比如，一个最简单的 NFS 存储插件就不需要这两个阶段）时，你就可以通过这个接口返回：本插件不提供 CSI Controller 服务，即：没有 csi.PluginCapability_Service_CONTROLLER_SERVICE 这个“能力”。这样，Kubernetes 就知道这个信息了。
+
+​	最后，**CSI Identity 服务还提供了一个 Probe 接口**。Kubernetes 会调用它来检查这个 CSI 插件是否正常工作。
+
+​	一般情况下，我建议你在编写插件时给它设置一个 Ready 标志，当插件的 gRPC Server 停止的时候，把这个 Ready 标志设置为 false。或者，你可以在这里访问一下插件的端口，类似于健康检查的做法。
+
+​	然后，我们要开始编写 CSI 插件的第二个服务，即 CSI Controller 服务了。它的代码实现，在 controller.go 文件里。
+
+​	在上一篇文章中我已经为你讲解过，这个服务主要实现的就是 Volume 管理流程中的“Provision 阶段”和“Attach 阶段”。**“Provision 阶段”对应的接口，是 CreateVolume 和 DeleteVolume**，它们的调用者是 External Provisoner。以 CreateVolume 为例，它的主要逻辑如下所示：
+
+```go
+func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
+ ...
+ 
+ volumeReq := &godo.VolumeCreateRequest{
+  Region:        d.region,
+  Name:          volumeName,
+  Description:   createdByDO,
+  SizeGigaBytes: size / GB,
+ }
+ 
+ ...
+ 
+ vol, _, err := d.doClient.Storage.CreateVolume(ctx, volumeReq)
+ 
+ ...
+ 
+ resp := &csi.CreateVolumeResponse{
+  Volume: &csi.Volume{
+   Id:            vol.ID,
+   CapacityBytes: size,
+   AccessibleTopology: []*csi.Topology{
+    {
+     Segments: map[string]string{
+      "region": d.region,
+     },
+    },
+   },
+  },
+ }
+ 
+ return resp, nil
+}
+```
+
+​	可以看到，对于 DigitalOcean 这样的公有云来说，CreateVolume 需要做的操作，就是调用 DigitalOcean 块存储服务的 API，创建出一个存储卷（d.doClient.Storage.CreateVolume）。如果你使用的是其他类型的块存储（比如 Cinder、Ceph RBD 等），对应的操作也是类似地调用创建存储卷的 API。
+
+​	**而“Attach 阶段”对应的接口是 ControllerPublishVolume 和 ControllerUnpublishVolume**，它们的调用者是 External Attacher。以 ControllerPublishVolume 为例，它的逻辑如下所示：
+
+```go
+func (d *Driver) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
+ ...
+ 
+  dropletID, err := strconv.Atoi(req.NodeId)
+  
+  // check if volume exist before trying to attach it
+  _, resp, err := d.doClient.Storage.GetVolume(ctx, req.VolumeId)
+ 
+ ...
+ 
+  // check if droplet exist before trying to attach the volume to the droplet
+  _, resp, err = d.doClient.Droplets.Get(ctx, dropletID)
+ 
+ ...
+ 
+  action, resp, err := d.doClient.StorageActions.Attach(ctx, req.VolumeId, dropletID)
+
+ ...
+ 
+ if action != nil {
+  ll.Info("waiting until volume is attached")
+ if err := d.waitAction(ctx, req.VolumeId, action.ID); err != nil {
+  return nil, err
+  }
+  }
+  
+  ll.Info("volume is attached")
+ return &csi.ControllerPublishVolumeResponse{}, nil
+}
+```
+
+​	可以看到，对于 DigitalOcean 来说，ControllerPublishVolume 在“Attach 阶段”需要做的工作，是调用 DigitalOcean 的 API，将我们前面创建的存储卷，挂载到指定的虚拟机上（d.doClient.StorageActions.Attach）。
+
+​	其中，存储卷由请求中的 VolumeId 来指定。而虚拟机，也就是将要运行 Pod 的宿主机，则由请求中的 NodeId 来指定。这些参数，都是 External Attacher 在发起请求时需要设置的。
+
+​	我在上一篇文章中已经为你介绍过，External Attacher 的工作原理，是监听（Watch）了一种名叫 VolumeAttachment 的 API 对象。这种 API 对象的主要字段如下所示：
+
+```go
+// VolumeAttachmentSpec is the specification of a VolumeAttachment request.
+type VolumeAttachmentSpec struct {
+ // Attacher indicates the name of the volume driver that MUST handle this
+ // request. This is the name returned by GetPluginName().
+ Attacher string
+ 
+ // Source represents the volume that should be attached.
+ Source VolumeAttachmentSource
+ 
+ // The node that the volume should be attached to.
+ NodeName string
+}
+```
+
+​	而这个对象的生命周期，正是由 AttachDetachController 负责管理的。
+
+​	这个控制循环的职责，是不断检查 Pod 所对应的 PV，在它所绑定的宿主机上的挂载情况，从而决定是否需要对这个 PV 进行 Attach（或者 Dettach）操作。
+
+​	而这个 Attach 操作，在 CSI 体系里，就是创建出上面这样一个 VolumeAttachment 对象。可以看到，Attach 操作所需的 PV 的名字（Source）、宿主机的名字（NodeName）、存储插件的名字（Attacher），都是这个 VolumeAttachment 对象的一部分。
+
+​	而当 External Attacher 监听到这样的一个对象出现之后，就可以立即使用 VolumeAttachment 里的这些字段，封装成一个 gRPC 请求调用 CSI Controller 的 ControllerPublishVolume 方法。
+
+​	最后，我们就可以编写 CSI Node 服务了。
+
+​	CSI Node 服务对应的，是 Volume 管理流程里的“Mount 阶段”。它的代码实现，在 node.go 文件里。
+
+​	我在上一篇文章里曾经提到过，kubelet 的 VolumeManagerReconciler 控制循环会直接调用 CSI Node 服务来完成 Volume 的“Mount 阶段”。不过，在具体的实现中，这个“Mount 阶段”的处理其实被细分成了 NodeStageVolume 和 NodePublishVolume 这两个接口。
+
+​	这里的原因其实也很容易理解：我曾经介绍过，对于磁盘以及块设备来说，它们被 Attach 到宿主机上之后，就成为了宿主机上的一个待用存储设备。而到了“Mount 阶段”，我们首先需要格式化这个设备，然后才能把它挂载到 Volume 对应的宿主机目录上。
+
+​	在 kubelet 的 VolumeManagerReconciler 控制循环中，这两步操作分别叫作 **MountDevice 和 SetUp**。
+
+​	其中，MountDevice 操作，就是直接调用了 CSI Node 服务里的 NodeStageVolume 接口。顾名思义，这个接口的作用，就是格式化 Volume 在宿主机上对应的存储设备，然后挂载到一个临时目录（Staging 目录）上。对于 DigitalOcean 来说，它对 NodeStageVolume 接口的实现如下所示：
+
+```go
+func (d *Driver) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
+ ...
+ 
+ vol, resp, err := d.doClient.Storage.GetVolume(ctx, req.VolumeId)
+ 
+ ...
+ 
+ source := getDiskSource(vol.Name)
+ target := req.StagingTargetPath
+ 
+ ...
+ 
+ if !formatted {
+  ll.Info("formatting the volume for staging")
+  if err := d.mounter.Format(source, fsType); err != nil {
+   return nil, status.Error(codes.Internal, err.Error())
+  }
+ } else {
+  ll.Info("source device is already formatted")
+ }
+ 
+...
+
+ if !mounted {
+  if err := d.mounter.Mount(source, target, fsType, options...); err != nil {
+   return nil, status.Error(codes.Internal, err.Error())
+  }
+ } else {
+  ll.Info("source device is already mounted to the target path")
+ }
+ 
+ ...
+ return &csi.NodeStageVolumeResponse{}, nil
+}
+```
+
+​	可以看到，在 NodeStageVolume 的实现里，我们首先通过 DigitalOcean 的 API 获取到了这个 Volume 对应的设备路径（getDiskSource）；然后，我们把这个设备格式化成指定的格式（ d.mounter.Format）；最后，我们把格式化后的设备挂载到了一个临时的 Staging 目录（StagingTargetPath）下。而 SetUp 操作则会调用 CSI Node 服务的 NodePublishVolume 接口。有了上述对设备的预处理工作后，它的实现就非常简单了，如下所示：
+
+```go
+func (d *Driver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
+ ...
+ source := req.StagingTargetPath
+ target := req.TargetPath
+ 
+ mnt := req.VolumeCapability.GetMount()
+ options := mnt.MountFlag
+    ...
+    
+ if !mounted {
+  ll.Info("mounting the volume")
+  if err := d.mounter.Mount(source, target, fsType, options...); err != nil {
+   return nil, status.Error(codes.Internal, err.Error())
+  }
+ } else {
+  ll.Info("volume is already mounted")
+ }
+ 
+ return &csi.NodePublishVolumeResponse{}, nil
+}
+```
+
+​	可以看到，在这一步实现中，我们只需要做一步操作，即：将 Staging 目录，绑定挂载到 Volume 对应的宿主机目录上。
+
+​	由于 Staging 目录，正是 Volume 对应的设备被格式化后挂载在宿主机上的位置，所以当它和 Volume 的宿主机目录绑定挂载之后，这个 Volume 宿主机目录的“持久化”处理也就完成了。当然，我在前面也曾经提到过，对于文件系统类型的存储服务来说，比如 NFS 和 GlusterFS 等，它们并没有一个对应的磁盘“设备”存在于宿主机上，所以 kubelet 在 VolumeManagerReconciler 控制循环中，会跳过 MountDevice 操作而直接执行 SetUp 操作。
+
+​	所以对于它们来说，也就不需要实现 NodeStageVolume 接口了。在编写完了 CSI 插件之后，我们就可以把这个插件和 External Components 一起部署起来。首先，我们需要创建一个 DigitalOcean client 授权需要使用的 Secret 对象，如下所示：
 
 ```yaml
-kind: PersistentVolumeClaim
 apiVersion: v1
+kind: Secret
 metadata:
-  name: example-local-claim
+  name: digitalocean
+  namespace: kube-system
+stringData:
+  access-token: "a05dd2f26b9b9ac2asdas__REPLACE_ME____123cb5d1ec17513e06da"
+```
+
+​	接下来，我们通过一句指令就可以将 CSI 插件部署起来：
+
+```shell
+$ kubectl apply -f https://raw.githubusercontent.com/digitalocean/csi-digitalocean/master/deploy/kubernetes/releases/csi-digitalocean-v0.2.0.yaml
+```
+
+​	这个 CSI 插件的 YAML 文件的主要内容如下所示（其中，非重要的内容已经被略去）：
+
+```yaml
+kind: DaemonSet
+apiVersion: apps/v1beta2
+metadata:
+  name: csi-do-node
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: csi-do-node
+  template:
+    metadata:
+      labels:
+        app: csi-do-node
+        role: csi-do
+    spec:
+      serviceAccount: csi-do-node-sa
+      hostNetwork: true
+      containers:
+        - name: driver-registrar
+          image: quay.io/k8scsi/driver-registrar:v0.3.0
+          ...
+        - name: csi-do-plugin
+          image: digitalocean/do-csi-plugin:v0.2.0
+          args :
+            - "--endpoint=$(CSI_ENDPOINT)"
+            - "--token=$(DIGITALOCEAN_ACCESS_TOKEN)"
+            - "--url=$(DIGITALOCEAN_API_URL)"
+          env:
+            - name: CSI_ENDPOINT
+              value: unix:///csi/csi.sock
+            - name: DIGITALOCEAN_API_URL
+              value: https://api.digitalocean.com/
+            - name: DIGITALOCEAN_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: digitalocean
+                  key: access-token
+          imagePullPolicy: "Always"
+          securityContext:
+            privileged: true
+            capabilities:
+              add: ["SYS_ADMIN"]
+            allowPrivilegeEscalation: true
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: pods-mount-dir
+              mountPath: /var/lib/kubelet
+              mountPropagation: "Bidirectional"
+            - name: device-dir
+              mountPath: /dev
+      volumes:
+        - name: plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/com.digitalocean.csi.dobs
+            type: DirectoryOrCreate
+        - name: pods-mount-dir
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        - name: device-dir
+          hostPath:
+            path: /dev
+---
+kind: StatefulSet
+apiVersion: apps/v1beta1
+metadata:
+  name: csi-do-controller
+  namespace: kube-system
+spec:
+  serviceName: "csi-do"
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: csi-do-controller
+        role: csi-do
+    spec:
+      serviceAccount: csi-do-controller-sa
+      containers:
+        - name: csi-provisioner
+          image: quay.io/k8scsi/csi-provisioner:v0.3.0
+          ...
+        - name: csi-attacher
+          image: quay.io/k8scsi/csi-attacher:v0.3.0
+          ...
+        - name: csi-do-plugin
+          image: digitalocean/do-csi-plugin:v0.2.0
+          args :
+            - "--endpoint=$(CSI_ENDPOINT)"
+            - "--token=$(DIGITALOCEAN_ACCESS_TOKEN)"
+            - "--url=$(DIGITALOCEAN_API_URL)"
+          env:
+            - name: CSI_ENDPOINT
+              value: unix:///var/lib/csi/sockets/pluginproxy/csi.sock
+            - name: DIGITALOCEAN_API_URL
+              value: https://api.digitalocean.com/
+            - name: DIGITALOCEAN_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: digitalocean
+                  key: access-token
+          imagePullPolicy: "Always"
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /var/lib/csi/sockets/pluginproxy/
+      volumes:
+        - name: socket-dir
+          emptyDir: {}
+```
+
+​	可以看到，我们编写的 CSI 插件只有一个二进制文件，它的镜像是 digitalocean/do-csi-plugin:v0.2.0。而**我们部署 CSI 插件的常用原则是**：
+
+**第一，通过 DaemonSet 在每个节点上都启动一个 CSI 插件，来为 kubelet 提供 CSI Node 服务**。这是因为，CSI Node 服务需要被 kubelet 直接调用，所以它要和 kubelet“一对一”地部署起来。
+
+​	此外，在上述 DaemonSet 的定义里面，除了 CSI 插件，我们还以 sidecar 的方式运行着 driver-registrar 这个外部组件。它的作用，是向 kubelet 注册这个 CSI 插件。这个注册过程使用的插件信息，则通过访问同一个 Pod 里的 CSI 插件容器的 Identity 服务获取到。
+
+​	需要注意的是，由于 CSI 插件运行在一个容器里，那么 CSI Node 服务在“Mount 阶段”执行的挂载操作，实际上是发生在这个容器的 Mount Namespace 里的。可是，我们真正希望执行挂载操作的对象，都是宿主机 /var/lib/kubelet 目录下的文件和目录。
+
+​	所以，在定义 DaemonSet Pod 的时候，我们需要把宿主机的 /var/lib/kubelet 以 Volume 的方式挂载进 CSI 插件容器的同名目录下，然后设置这个 Volume 的 mountPropagation=Bidirectional，即开启双向挂载传播，从而将容器在这个目录下进行的挂载操作“传播”给宿主机，反之亦然。
+
+​	**第二，通过 StatefulSet 在任意一个节点上再启动一个 CSI 插件，为 External Components 提供 CSI Controller 服务**。
+
+​	所以，作为 CSI Controller 服务的调用者，External Provisioner 和 External Attacher 这两个外部组件，就需要以 sidecar 的方式和这次部署的 CSI 插件定义在同一个 Pod 里。你可能会好奇，为什么我们会用 StatefulSet 而不是 Deployment 来运行这个 CSI 插件呢。这是因为，由于 StatefulSet 需要确保应用拓扑状态的稳定性，所以它对 Pod 的更新，是严格保证顺序的，即：只有在前一个Pod 停止并删除之后，它才会创建并启动下一个 Pod。而像我们上面这样将 StatefulSet 的 replicas 设置为 1 的话，StatefulSet 就会确保 Pod 被删除重建的时候，永远有且只有一个 CSI 插件的 Pod 运行在集群中。这对 CSI 插件的正确性来说，至关重要。而在今天这篇文章一开始，我们就已经定义了这个 CSI 插件对应的 StorageClass（即：do-block-storage），所以你接下来只需要定义一个声明使用这个 StorageClass 的 PVC 即可，如下所示：
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: csi-pvc
 spec:
   accessModes:
   - ReadWriteOnce
   resources:
     requests:
       storage: 5Gi
-  storageClassName: local-storage
+  storageClassName: do-block-storage
 ```
 
-​	可以看到，这个 PVC 没有任何特别的地方。唯一需要注意的是，它声明的 storageClassName 是 local-storage。所以，将来 Kubernetes 的 Volume Controller 看到这个 PVC 的时候，不会为它进行绑定操作。
-
-​	现在，我们来创建这个 PVC：
-
-```shell
-$ kubectl create -f local-pvc.yaml 
-persistentvolumeclaim/example-local-claim created
-
-$ kubectl get pvc
-NAME                  STATUS    VOLUME    CAPACITY   ACCESS MODES   STORAGECLASS    AGE
-example-local-claim   Pending                                       local-storage   7s
-```
-
-​	可以看到，尽管这个时候，Kubernetes 里已经存在了一个可以与 PVC 匹配的 PV，但这个 PVC 依然处于 Pending 状态，也就是等待绑定的状态。
-
-​	**然后，我们编写一个 Pod 来声明使用这个 PVC**，如下所示：
-
-```yaml
-kind: Pod
-apiVersion: v1
-metadata:
-  name: example-pv-pod
-spec:
-  volumes:
-    - name: example-pv-storage
-      persistentVolumeClaim:
-       claimName: example-local-claim
-  containers:
-    - name: example-pv-container
-      image: nginx
-      ports:
-        - containerPort: 80
-          name: "http-server"
-      volumeMounts:
-        - mountPath: "/usr/share/nginx/html"
-          name: example-pv-storage
-```
-
-​	这个 Pod 没有任何特别的地方，你只需要注意，它的 volumes 字段声明要使用前面定义的、名叫 example-local-claim 的 PVC 即可。
-
-​	而我们一旦使用 `kubectl create` 创建这个 Pod，就会发现，我们前面定义的 PVC，会立刻变成 Bound 状态，与前面定义的 PV 绑定在了一起，如下所示：
-
-```shell
-$ kubectl create -f local-pod.yaml 
-pod/example-pv-pod created
-
-$ kubectl get pvc
-NAME                  STATUS    VOLUME       CAPACITY   ACCESS MODES   STORAGECLASS    AGE
-example-local-claim   Bound     example-pv   5Gi        RWO            local-storage   6h
-```
-
-​	也就是说，在我们创建的 Pod 进入调度器之后，“绑定”操作才开始进行。
-
-​	这时候，我们可以尝试在这个 Pod 的 Volume 目录里，创建一个测试文件，比如：
-
-```shell
-$ kubectl exec -it example-pv-pod -- /bin/sh
-# cd /usr/share/nginx/html
-# touch test.txt
-```
-
-​	然后，登录到 node-1 这台机器上，查看一下它的 /mnt/disks/vol1 目录下的内容，你就可以看到刚刚创建的这个文件：
-
-```shell
-# 在node-1上
-$ ls /mnt/disks/vol1
-test.txt
-```
-
-​	而如果你重新创建这个 Pod 的话，就会发现，我们之前创建的测试文件，依然被保存在这个持久化 Volume 当中：
-
-```shell
-$ kubectl delete -f local-pod.yaml 
-
-$ kubectl create -f local-pod.yaml 
-
-$ kubectl exec -it example-pv-pod -- /bin/sh
-# ls /usr/share/nginx/html
-# touch test.txt
-```
-
-​	这就说明，像 Kubernetes 这样构建出来的、基于本地存储的 Volume，完全可以提供容器持久化存储的功能。所以，像 StatefulSet 这样的有状态编排工具，也完全可以通过声明 Local 类型的 PV 和 PVC，来管理应用的存储状态。
-
-​	**需要注意的是，我们上面手动创建 PV 的方式，即 Static 的 PV 管理方式，在删除 PV 时需要按如下流程执行操作**：
-
-1. 删除使用这个 PV 的 Pod；
-2. 从宿主机移除本地磁盘（比如，umount 它）；
-3. 删除 PVC；
-4. 删除 PV。
-
-​	如果不按照这个流程的话，这个 PV 的删除就会失败。
-
-​	当然，由于上面这些创建 PV 和删除 PV 的操作比较繁琐，Kubernetes 其实提供了一个 Static Provisioner 来帮助你管理这些 PV。
-
-​	比如，我们现在的所有磁盘，都挂载在宿主机的 /mnt/disks 目录下。
-
-​	那么，当 Static Provisioner 启动后，它就会通过 DaemonSet，自动检查每个宿主机的 /mnt/disks 目录。然后，调用 Kubernetes API，为这些目录下面的每一个挂载，创建一个对应的 PV 对象出来。这些自动创建的 PV，如下所示：
-
-```shell
-$ kubectl get pv
-NAME                CAPACITY    ACCESSMODES   RECLAIMPOLICY   STATUS      CLAIM     STORAGECLASS    REASON    AGE
-local-pv-ce05be60   1024220Ki   RWO           Delete          Available             local-storage             26s
-
-$ kubectl describe pv local-pv-ce05be60 
-Name:  local-pv-ce05be60
-...
-StorageClass: local-storage
-Status:  Available
-Claim:  
-Reclaim Policy: Delete
-Access Modes: RWO
-Capacity: 1024220Ki
-NodeAffinity:
-  Required Terms:
-      Term 0:  kubernetes.io/hostname in [node-1]
-Message: 
-Source:
-    Type: LocalVolume (a persistent volume backed by local storage on a node)
-    Path: /mnt/disks/vol1
-```
-
-​	这个 PV 里的各种定义，比如 StorageClass 的名字、本地磁盘挂载点的位置，都可以通过 provisioner 的[配置文件指定](https://github.com/kubernetes-incubator/external-storage/tree/master/local-volume/helm)。当然，provisioner 也会负责前面提到的 PV 的删除工作。
-
-​	而这个 provisioner 本身，其实也是一个我们前面提到过的[External Provisioner](https://github.com/kubernetes-retired/external-storage/tree/master/local-volume)，它的部署方法，在[对应的文档里](https://github.com/kubernetes-incubator/external-storage/tree/master/local-volume#option-1-using-the-local-volume-static-provisioner)有详细描述。这部分内容，就留给你课后自行探索了。
+​	当你把上述 PVC 提交给 Kubernetes 之后，你就可以在 Pod 里声明使用这个 csi-pvc 来作为持久化存储了。这一部分使用 PV 和 PVC 的内容，我就不再赘述了。
 
 ## 总结
 
-​	在今天这篇文章中，我为你详细介绍了 Kubernetes 里 Local Persistent Volume 的实现方式。
+​	在今天这篇文章中，我以一个 DigitalOcean 的 CSI 插件为例，和你分享了编写 CSI 插件的具体流程。基于这些讲述，你现在应该已经对 Kubernetes 持久化存储体系有了一个更加全面和深入的认识。举个例子，对于一个部署了 CSI 存储插件的 Kubernetes 集群来说：当用户创建了一个 PVC 之后，你前面部署的 StatefulSet 里的 External Provisioner 容器，就会监听到这个 PVC 的诞生，然后调用同一个 Pod 里的 CSI 插件的 CSI Controller 服务的 CreateVolume 方法，为你创建出对应的 PV。
 
-​	可以看到，正是通过 PV 和 PVC，以及 StorageClass 这套存储体系，这个后来新添加的持久化存储方案，对 Kubernetes 已有用户的影响，几乎可以忽略不计。作为用户，你的 Pod 的 YAML 和 PVC 的 YAML，并没有任何特殊的改变，这个特性所有的实现只会影响到 PV 的处理，也就是由运维人员负责的那部分工作。
+​	这时候，运行在 Kubernetes Master 节点上的 Volume Controller，就会通过 PersistentVolumeController 控制循环，发现这对新创建出来的 PV 和 PVC，并且看到它们声明的是同一个 StorageClass。所以，它会把这一对 PV 和 PVC 绑定起来，使 PVC 进入 Bound 状态。
 
-​	而这，正是这套存储体系带来的“解耦”的好处。
+​	然后，用户创建了一个声明使用上述 PVC 的 Pod，并且这个 Pod 被调度器调度到了宿主机 A 上。这时候，Volume Controller 的 AttachDetachController 控制循环就会发现，上述 PVC 对应的 Volume，需要被 Attach 到宿主机 A 上。所以，AttachDetachController 会创建一个 VolumeAttachment 对象，这个对象携带了宿主机 A 和待处理的 Volume 的名字。这样，StatefulSet 里的 External Attacher 容器，就会监听到这个 VolumeAttachment 对象的诞生。
 
-​	其实，Kubernetes 很多看起来比较“繁琐”的设计（比如“声明式 API”，以及我今天讲解的“PV、PVC 体系”）的主要目的，都是希望为开发者提供更多的“可扩展性”，给使用者带来更多的“稳定性”和“安全感”。这两个能力的高低，是衡量开源基础设施项目水平的重要标准。
+​	于是，它就会使用这个对象里的宿主机和 Volume 名字，调用同一个 Pod 里的 CSI 插件的 CSI Controller 服务的 ControllerPublishVolume 方法，完成“Attach 阶段”。
+
+​	上述过程完成后，运行在宿主机 A 上的 kubelet，就会通过 VolumeManagerReconciler 控制循环，发现当前宿主机上有一个 Volume 对应的存储设备（比如磁盘）已经被 Attach 到了某个设备目录下。于是 kubelet 就会调用同一台宿主机上的 CSI 插件的 CSI Node 服务的 NodeStageVolume 和 NodePublishVolume 方法，完成这个 Volume 的“Mount 阶段”。
+
+至此，一个完整的持久化 Volume 的创建和挂载流程就结束了。
 
 ## 思考题
 
-​	正是由于需要使用“延迟绑定”这个特性，Local Persistent Volume 目前还不能支持 Dynamic Provisioning。你是否能说出，为什么“延迟绑定”会跟 Dynamic Provisioning 有冲突呢？	
-
-​	因为当一个pvc创建之后，kubernetes因为dynamic provisioning机制会调用pvc指定的storageclass里的provisioner自动使用local disk的信息去创建pv。而且pv一旦创建，nodeaffinity参数就指定了固定的node。而此时，provisioner并没有pod调度的相关信息。 延迟绑定发生的时机是pod已经进入调度器。此时对应的pv已经创建，绑定了node。并可能与pod的调度信息发生冲突。 如果dynamic provisioning机制能够推迟到pod 调度的阶段，同时考虑pod调度条件和node硬件信息，这样才能实现dynamic provisioning。实现上可以参考延迟绑定，来一个延迟 provision。另外实现一个controller在pod调度阶段创建pv。
-
+​	请你根据编写 FlexVolume 和 CSI 插件的流程，分析一下什么时候该使用 FlexVolume，什么时候应该使用 CSI？
