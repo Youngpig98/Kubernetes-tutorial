@@ -43,7 +43,7 @@
   - [Dynamic Provisioning原理分析](./workspace/senior/p21)
   - [编写自己的存储插件：FlexVolume与CSI](./workspace/senior/p19)
   - [容器存储实践：CSI插件编写指南](./workspace/senior/p20)
-  - [kubernetes存储：local，openEBS，rook ceph](./workspace/senior/p16)
+  - [kubernetes存储：local，openEBS，rook ceph](https://blog.csdn.net/weixin_45843419/article/details/124603184)
 - Kubernetes容器网络
   - [深入解析容器跨主机网络](./workspace/senior/p25)
   - [Kubernetes网络模型与CNI网络插件](./workspace/senior/p26)
