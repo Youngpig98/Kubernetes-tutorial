@@ -196,21 +196,17 @@ kubeadm join 192.168.159.143:6443 --token nuja6n.o3jrhsffiqs9swnu --discovery-to
 
 ​	Calico是一个纯三层的数据中心网络方案，Calico支持广泛的平台，包括Kubernetes、OpenStack等。它在每一个计算节点利用 Linux Kernel 实现了一个高效的虚拟路由器（ vRouter） 来负责数据转发，而每个 vRouter 通过 BGP 协议负责把自己上运行的 workload 的路由信息向整个 Calico 网络内传播。此外，Calico  项目还实现了 Kubernetes 网络策略，提供ACL功能。
 
-​	可以使用本仓库中提供的[calico.yaml](./calico.yaml)
+​	可以使用本仓库中提供的[calico.yaml](./calico.yaml)，这里使用的是3.18版本（官网：https://docs.tigera.io/archive/v3.18/getting-started/kubernetes/self-managed-onprem/onpremises）
 
 ​	下载完后还需要修改里面配置项：
 
 - 定义Pod网络（CALICO_IPV4POOL_CIDR），与前面kubeadmin.conf文件中的podSubnet配置一样
 - 选择工作模式（CALICO_IPV4POOL_IPIP），支持**BGP（Never）**、**IPIP（Always）**、**CrossSubnet**（开启BGP并支持跨子网）。选择默认的Always即可。
 
-
-
 ​	修改完后应用清单：
 
 ```shell
 kubectl apply -f calico.yaml
-
-
 kubectl get pods -n kube-system
 ```
 
