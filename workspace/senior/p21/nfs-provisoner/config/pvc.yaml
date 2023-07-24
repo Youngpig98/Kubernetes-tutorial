@@ -4,28 +4,9 @@ metadata:
   name: test-pvc
 spec:
   accessModes:
-    - ReadWriteOnce
+    - ReadWriteMany
   storageClassName: nfs
   resources:
     requests:
       storage: 1Gi
 
-
-
-apiVersion: v1
-items:
-  - apiVersion: v1
-    kind: PersistentVolume
-    metadata:
-      name: pvc-74e6c8ff-033c-4d72-b67f-3c649cf86492
-    spec:
-      accessModes:
-        - ReadWriteOnce
-      capacity:
-        storage: 1Gi
-      nfs:
-        path: /young/data/pvc-74e6c8ff-033c-4d72-b67f-3c649cf86492
-        server: 192.168.159.143
-      persistentVolumeReclaimPolicy: Delete
-      storageClassName: nfs
-      volumeMode: Filesystem

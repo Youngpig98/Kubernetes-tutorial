@@ -104,13 +104,13 @@ spec:
           image: nfs-provisioner:v0.1
           imagePullPolicy: IfNotPresent
           args:
-            - --server= # 配置nfs server ip
-            - --serverPath= # 配置nfs server root path
+            - --server=192.168.159.143
+            - --serverPath=/young/data
           volumeMounts:
             - name: nfs
               mountPath: /mount
       volumes:
         - name: nfs
           nfs:
-            server: "" # 配置nfs server ip
-            path: "" # 配置nfs server root path
+            server: "192.168.159.143"
+            path: "/young/data"
